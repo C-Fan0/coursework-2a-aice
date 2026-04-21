@@ -336,7 +336,136 @@ let oat_alloc_array (t:Ast.ty) (size:Ll.operand) : Ll.ty * operand * stream =
      compiling Call  
 *)
 let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
-  failwith "cmp_exp unimplemented"    
+  match exp.elt with
+
+  | CNull rty ->
+    cmp_ty (TRef rty), Null, []
+
+  | CBool b ->
+    I1, Const (if b then 1L else 0L), []
+
+  | CInt i ->
+    I64, Const i, []
+
+  | CStr s ->
+    let gid = gensym "str" in
+    let len = String.length s + 1 in
+    let arr_ty = Array (len, I8) in
+    let ptr_id = gensym "str_ptr" in
+    Ptr I8, Id ptr_id,
+      [ G (gid, (arr_ty, GString s))
+      ; I (ptr_id, Gep (arr_ty, Gid gid, [Const 0L; Const 0L]))
+      ]
+
+  | Lhs lhs ->
+    let ptr_ty, ptr_op, lhs_code = cmp_lhs c lhs in
+    let val_ty = match ptr_ty with
+      | Ptr t -> t
+      | _ -> failwith "cmp_exp Lhs: expected pointer type"
+    in
+    let id = gensym "load" in
+    val_ty, Id id,
+      lhs_code >:: I (id, Load (ptr_ty, ptr_op))
+
+  | Bop (bop, e1, e2) ->
+    let _, _, ret_ty = typ_of_binop bop in
+    let t1, op1, code1 = cmp_exp c e1 in
+    let t2, op2, code2 = cmp_exp c e2 in
+    let id = gensym "bop" in
+    cmp_ty ret_ty, Id id,
+      code1 >@ code2 >:: I (id, cmp_binop bop t1 op1 op2)
+
+  | Uop (uop, e) ->
+    let _, ret_ty = typ_of_unop uop in
+    let t, op, code = cmp_exp c e in
+    let id = gensym "uop" in
+    cmp_ty ret_ty, Id id,
+      code >:: I (id, cmp_unop uop t op)
+
+  | NewArr (elt_ty, len_exp) ->
+    let _, len_op, len_code = cmp_exp c len_exp in
+    let arr_ty, arr_op, alloc_code = oat_alloc_array elt_ty len_op in
+    arr_ty, arr_op,
+      len_code >@ alloc_code
+
+  | CArr (elt_ty, elts) ->
+    let n = List.length elts in
+    let arr_ty, arr_op, alloc_code = oat_alloc_array elt_ty (Const (Int64.of_int n)) in
+    let ll_elt_ty = cmp_ty elt_ty in
+    let struct_ty = Struct [I64; Array (0, ll_elt_ty)] in
+    let store_code = List.concat @@ List.mapi (fun i e ->
+      let _, elt_op, elt_code = cmp_exp c e in
+      let ptr_id = gensym "carr_ptr" in
+      elt_code
+      >:: I (ptr_id, Gep (struct_ty, arr_op,
+              [Const 0L; Const 1L; Const (Int64.of_int i)]))
+      >:: I (gensym "store", Store (ll_elt_ty, elt_op, Id ptr_id))
+    ) elts in
+    arr_ty, arr_op,
+      alloc_code >@ store_code
+
+  | Call (fname, arg_exps) ->
+    let fn_ty, fn_op = Ctxt.lookup_function fname c in
+    let _, ret_ty = match fn_ty with
+      | Ptr (Fun (a, r)) -> a, r
+      | _ -> failwith "cmp_exp Call: not a function pointer"
+    in
+    let args_code, args = List.fold_right (fun arg_exp (code, ops) ->
+      let arg_ty, arg_op, arg_code = cmp_exp c arg_exp in
+      code >@ arg_code, (arg_ty, arg_op) :: ops
+    ) arg_exps ([], []) in
+    let id = gensym "call" in
+    ret_ty, Id id,
+      args_code >:: I (id, Call (ret_ty, fn_op, args))
+
+and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
+  match l.elt with
+
+  | Id id ->
+    let (ty, op) = Ctxt.lookup id c in
+    Ptr ty, op, []
+
+  | Index (arr_exp, idx_exp) ->
+    let arr_ty, arr_op, arr_code = cmp_exp c arr_exp in
+    let _, idx_op, idx_code = cmp_exp c idx_exp in
+    let struct_ty = match arr_ty with
+      | Ptr s -> s
+      | _ -> failwith "cmp_lhs Index: array operand not a pointer"
+    in
+    let elt_ty = match struct_ty with
+      | Struct [I64; Array (_, t)] -> t
+      | _ -> failwith "cmp_lhs Index: unexpected struct type"
+    in
+    let ptr_id = gensym "index_ptr" in
+    Ptr elt_ty, Id ptr_id,
+      arr_code >@ idx_code
+      >:: I (ptr_id, Gep (struct_ty, arr_op,
+              [Const 0L; Const 1L; idx_op]))
+
+and cmp_binop (bop:Ast.binop) (t:Ll.ty) (op1:Ll.operand) (op2:Ll.operand) : Ll.insn =
+  match bop with
+  | Add  -> Binop (Add,  t, op1, op2)
+  | Sub  -> Binop (Sub,  t, op1, op2)
+  | Mul  -> Binop (Mul,  t, op1, op2)
+  | IAnd -> Binop (And,  t, op1, op2)
+  | IOr  -> Binop (Or,   t, op1, op2)
+  | Shl  -> Binop (Shl,  t, op1, op2)
+  | Shr  -> Binop (Lshr, t, op1, op2)
+  | Sar  -> Binop (Ashr, t, op1, op2)
+  | And  -> Binop (And,  t, op1, op2)
+  | Or   -> Binop (Or,   t, op1, op2)
+  | Eq   -> Icmp  (Eq,   t, op1, op2)
+  | Neq  -> Icmp  (Ne,   t, op1, op2)
+  | Lt   -> Icmp  (Slt,  t, op1, op2)
+  | Lte  -> Icmp  (Sle,  t, op1, op2)
+  | Gt   -> Icmp  (Sgt,  t, op1, op2)
+  | Gte  -> Icmp  (Sge,  t, op1, op2)
+
+and cmp_unop (uop:Ast.unop) (t:Ll.ty) (op:Ll.operand) : Ll.insn =
+  match uop with
+  | Neg    -> Binop (Sub,  t, Const 0L,            op)
+  | Bitnot -> Binop (Xor,  t, op,      Const Int64.minus_one)
+  | Lognot -> Binop (Xor,  t, op,      Const 1L) 
 
 (* compiles a left-hand side: produces and intruction stream that
    yields an operand to which a value can be stored (by Assn) or
@@ -345,8 +474,7 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
    Note that function identifiers *do not* correspond to valid left-hand-
    sides.
  *)
-and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
-  failwith "cmp_lhs unimplemented"    
+ 
 
     
 
