@@ -353,10 +353,9 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
     let arr_ty = Array (len, I8) in
     let ptr_id = gensym "str_ptr" in
     Ptr I8, Id ptr_id,
-      [ G (gid, (arr_ty, GString s))
-      ; I (ptr_id, Gep (arr_ty, Gid gid, [Const 0L; Const 0L]))
-      ]
-
+      [] 
+      >:: G (gid, (arr_ty, GString s))
+      >:: I (ptr_id, Gep (Ptr arr_ty, Gid gid, [Const 0L; Const 0L]))
   | Lhs lhs ->
     let ptr_ty, ptr_op, lhs_code = cmp_lhs c lhs in
     let val_ty = match ptr_ty with
@@ -397,7 +396,8 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       let _, elt_op, elt_code = cmp_exp c e in
       let ptr_id = gensym "carr_ptr" in
       elt_code
-      >:: I (ptr_id, Gep (struct_ty, arr_op,
+     (* NEW *)
+      >:: I (ptr_id, Gep (Ptr struct_ty, arr_op,
               [Const 0L; Const 1L; Const (Int64.of_int i)]))
       >:: I (gensym "store", Store (ll_elt_ty, elt_op, Id ptr_id))
     ) elts in
@@ -423,7 +423,7 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
 
   | Id id ->
     let (ty, op) = Ctxt.lookup id c in
-    Ptr ty, op, []
+    ty, op, []
 
   | Index (arr_exp, idx_exp) ->
     let arr_ty, arr_op, arr_code = cmp_exp c arr_exp in
@@ -436,10 +436,11 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
       | Struct [I64; Array (_, t)] -> t
       | _ -> failwith "cmp_lhs Index: unexpected struct type"
     in
+
     let ptr_id = gensym "index_ptr" in
     Ptr elt_ty, Id ptr_id,
       arr_code >@ idx_code
-      >:: I (ptr_id, Gep (struct_ty, arr_op,
+      >:: I (ptr_id, Gep (Ptr struct_ty, arr_op,
               [Const 0L; Const 1L; idx_op]))
 
 and cmp_binop (bop:Ast.binop) (t:Ll.ty) (op1:Ll.operand) (op2:Ll.operand) : Ll.insn =
@@ -496,7 +497,81 @@ and cmp_unop (uop:Ast.unop) (t:Ll.ty) (op:Ll.operand) : Ll.insn =
      expression to implement the SCall statement
  *)
 let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
-  failwith "cmp_stmt not implemented"
+  match stmt.elt with
+
+  | Ast.Ret None ->
+    c, [] >:: T (Ll.Ret (Ll.Void, None))
+
+  | Ast.Ret (Some e) ->
+    let ll_ty, operand, exp_stream = cmp_exp c e in
+    c, exp_stream >:: T (Ll.Ret (ll_ty, Some operand))
+
+  | Ast.Decl (id, e) ->
+    let ll_ty, operand, exp_stream = cmp_exp c e in
+    let slot = gensym id in
+    let c' = Ctxt.add c id (Ll.Ptr ll_ty, Ll.Id slot) in
+    c', exp_stream
+      >:: E (slot, Ll.Alloca ll_ty)
+      >:: I (gensym "store", Ll.Store (ll_ty, operand, Ll.Id slot))
+
+  | Ast.Assn (lhs, rhs) ->
+    let rhs_ty, rhs_op, rhs_stream = cmp_exp c rhs in
+    let _ptr_ty, ptr_op, lhs_stream = cmp_lhs c lhs in
+    c, rhs_stream >@ lhs_stream
+      >:: I (gensym "store", Ll.Store (rhs_ty, rhs_op, ptr_op))
+
+  | Ast.SCall (fname, args) ->
+    let _, _, call_stream =
+      cmp_exp c (Ast.no_loc (Ast.Call (fname, args))) in
+    c, call_stream
+
+  | Ast.If (cond, then_block, else_block) ->
+    let cond_ty, cond_op, cond_stream = cmp_exp c cond in
+    let _ = cond_ty in
+    let then_lbl  = gensym "then" in
+    let else_lbl  = gensym "else" in
+    let merge_lbl = gensym "merge" in
+    let _, then_stream = cmp_block c rt then_block in
+    let _, else_stream = cmp_block c rt else_block in
+    c, cond_stream
+      >:: T (Ll.Cbr (cond_op, then_lbl, else_lbl))
+      >:: L then_lbl
+      >@ then_stream
+      >:: T (Ll.Br merge_lbl)
+      >:: L else_lbl
+      >@ else_stream
+      >:: T (Ll.Br merge_lbl)
+      >:: L merge_lbl
+
+  | Ast.While (cond, body) ->
+    let cond_lbl = gensym "while_cond" in
+    let body_lbl = gensym "while_body" in
+    let exit_lbl = gensym "while_exit" in
+    let _, cond_op, cond_stream = cmp_exp c cond in
+    let _, body_stream = cmp_block c rt body in
+    c, [] >:: T (Ll.Br cond_lbl)
+      >:: L cond_lbl
+      >@ cond_stream
+      >:: T (Ll.Cbr (cond_op, body_lbl, exit_lbl))
+      >:: L body_lbl
+      >@ body_stream
+      >:: T (Ll.Br cond_lbl)
+      >:: L exit_lbl
+
+  | Ast.For (inits, cond_opt, update_opt, body) ->
+    let cond = match cond_opt with
+      | Some e -> e
+      | None   -> Ast.no_loc (Ast.CBool true)
+    in
+    let full_body = match update_opt with
+      | Some s -> body @ [s]
+      | None   -> body
+    in
+    let init_stmts = List.map (fun vd -> Ast.no_loc (Ast.Decl vd)) inits in
+    let c', init_stream = cmp_block c rt init_stmts in
+    let _, while_stream =
+      cmp_stmt c' rt (Ast.no_loc (Ast.While (cond, full_body))) in
+    c, init_stream >@ while_stream
 
 
 (* Compile a series of statements *)
@@ -528,7 +603,19 @@ let cmp_function_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
    in well-formed programs. (The constructors starting with C). 
 *)
 let cmp_global_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
-    failwith "cmp_global_ctxt unimplemented"
+    List.fold_left (fun c -> function
+    | Ast.Gvdecl { elt = { name; init } } ->
+      let ty = match init.elt with
+        | Ast.CNull r    -> cmp_ty (Ast.TRef r)
+        | Ast.CBool _    -> cmp_ty Ast.TBool
+        | Ast.CInt  _    -> cmp_ty Ast.TInt
+        | Ast.CStr  _    -> cmp_ty (Ast.TRef Ast.RString)
+        | Ast.CArr (t,_) -> cmp_ty (Ast.TRef (Ast.RArray t))
+        | _ -> failwith "cmp_global_ctxt: invalid global initialiser"
+      in
+      Ctxt.add c name (Ll.Ptr ty, Ll.Gid name)
+    | _ -> c
+  ) c p
 
 (* Compile a function declaration in global context c. Return the LLVMlite cfg
    and a list of global declarations containing the string literals appearing
@@ -542,7 +629,26 @@ let cmp_global_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
    5. Use cfg_of_stream to produce a LLVMlite cfg from the body
  *)
 let cmp_fdecl (c:Ctxt.t) (f:Ast.fdecl node) : Ll.fdecl * (Ll.gid * Ll.gdecl) list =
-  failwith "cmp_fdecl not implemented"
+  let { Ast.frtyp; fname=_; args; body } = f.elt in
+  let ret_ty = cmp_ret_ty frtyp in
+  let param_ids = List.map snd args in
+  let c', param_stream =
+    List.fold_left (fun (c_acc, stream_acc) (oat_ty, param_name) ->
+      let ll_ty  = cmp_ty oat_ty in
+      let slot   = gensym param_name in
+      let c_acc' = Ctxt.add c_acc param_name (Ll.Ptr ll_ty, Ll.Id slot) in
+      c_acc', stream_acc
+        >:: E (slot, Ll.Alloca ll_ty)
+        >:: I (gensym "store", Ll.Store (ll_ty, Ll.Id param_name, Ll.Id slot))
+    ) (c, []) args
+  in
+  let _, body_stream = cmp_block c' ret_ty body in
+  let full_stream = param_stream >@ body_stream in
+  let cfg, globals = cfg_of_stream full_stream in
+  { Ll.f_ty    = (List.map (fun (t,_) -> cmp_ty t) args, ret_ty)
+  ; Ll.f_param = param_ids
+  ; Ll.f_cfg   = cfg
+  }, globals
 
 
 (* Compile a global initializer, returning the resulting LLVMlite global
@@ -557,8 +663,40 @@ let cmp_fdecl (c:Ctxt.t) (f:Ast.fdecl node) : Ll.fdecl * (Ll.gid * Ll.gdecl) lis
      be an array of pointers to arrays emitted as additional global declarations.
 *)
 let rec cmp_gexp c (e:Ast.exp node) : Ll.gdecl * (Ll.gid * Ll.gdecl) list =
-  failwith "cmp_init not implemented"
+  match e.elt with
 
+  | CNull r ->
+    (cmp_ty (TRef r), GNull), []
+
+  | CBool b ->
+    (I1, GInt (if b then 1L else 0L)), []
+
+  | CInt i ->
+    (I64, GInt i), []
+
+  | CStr s ->
+    let gid = gensym "str" in
+    let len = String.length s + 1 in
+    let arr_ty = Array (len, I8) in
+    (Ptr I8, GBitcast (Ptr arr_ty, GGid gid, Ptr I8)),
+    [(gid, (arr_ty, GString s))]
+
+  | CArr (elt_ty, elts) ->
+    let n = List.length elts in
+    let ll_elt_ty = cmp_ty elt_ty in
+    let inner_arr_ty = Array (n, ll_elt_ty) in
+    let struct_ty = Struct [I64; inner_arr_ty] in
+    let gid = gensym "global_arr" in
+    let gdecls, extra_gs = List.split (List.map (cmp_gexp c) elts) in
+    let extra_gs = List.concat extra_gs in
+    let ginits = List.map snd gdecls in
+    let arr_init = GStruct [I64, GInt (Int64.of_int n);
+                            inner_arr_ty, GArray (List.map (fun gi -> ll_elt_ty, gi) ginits)] in
+    let ans_ty = cmp_ty (TRef (RArray elt_ty)) in
+    (ans_ty, GBitcast (Ptr struct_ty, GGid gid, ans_ty)),
+    (gid, (struct_ty, arr_init)) :: extra_gs
+
+  | _ -> failwith "invalid global initialiser"
 
 (* Oat internals function context ------------------------------------------- *)
 let internals = [
