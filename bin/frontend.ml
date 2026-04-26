@@ -396,7 +396,6 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       let _, elt_op, elt_code = cmp_exp c e in
       let ptr_id = gensym "carr_ptr" in
       elt_code
-     (* NEW *)
       >:: I (ptr_id, Gep (Ptr struct_ty, arr_op,
               [Const 0L; Const 1L; Const (Int64.of_int i)]))
       >:: I (gensym "store", Store (ll_elt_ty, elt_op, Id ptr_id))
